@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>雙軌音控台 Pro (iPad 零延遲版)</title>
+    <title>雙軌音控台 Pro (iPad 零延遲版 + 3秒漸變)</title>
     
     <script src="https://cdn.tailwindcss.com"></script>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
@@ -100,24 +100,32 @@
             const [isEditMode, setIsEditMode] = useState(true);
             const [isLoading, setIsLoading] = useState(false);
             
-            // 【核心修正】: 建立預先載入的音訊實體字典，不再共用單一 audio 標籤
             const audioCache = useRef({}); 
+            
+            // 【新增】：用於儲存每個音軌目前的漸變排程 ID，以防衝突
+            const fadeIntervals = useRef({});
 
-            // 監聽音量改變，即時套用給所有預載的音訊實體
+            // 監聽總音量改變
             useEffect(() => {
-                Object.values(audioCache.current).forEach(audio => {
-                    if (audio) audio.volume = volume;
+                Object.keys(audioCache.current).forEach(id => {
+                    const audio = audioCache.current[id];
+                    // 只有當該音軌「沒有」在進行 6 秒漸變時，才立即套用總音量
+                    // 避免滑桿與淡化效果打架
+                    if (audio && !fadeIntervals.current[id]) {
+                        if (id === activeBgmId || id === activeSfxId) {
+                            audio.volume = volume;
+                        }
+                    }
                 });
-            }, [volume]);
+            }, [volume, activeBgmId, activeSfxId]);
 
-            // 將建立實體獨立成函數
             const createAudioInstance = (id, url, listType) => {
                 if (audioCache.current[id]) {
                     audioCache.current[id].pause();
                     audioCache.current[id].src = "";
                 }
                 const audio = new Audio(url);
-                audio.preload = 'auto'; // 強制瀏覽器預先解碼，消除延遲
+                audio.preload = 'auto'; 
                 audio.volume = volume;
                 audio.onended = () => {
                     if (listType === 'bgm') setActiveBgmId(null);
@@ -137,7 +145,6 @@
                 const objectUrl = URL.createObjectURL(file);
                 const fileName = file.name.replace(/\.[^/.]+$/, "");
                 
-                // 【核心修正】：上傳當下立刻建立音訊實體
                 createAudioInstance(id, objectUrl, listType);
 
                 const updateList = listType === 'bgm' ? setBgms : setSfxs;
@@ -166,6 +173,10 @@
                     audioCache.current[id].pause();
                     delete audioCache.current[id];
                 }
+                if (fadeIntervals.current[id]) {
+                    cancelAnimationFrame(fadeIntervals.current[id]);
+                    delete fadeIntervals.current[id];
+                }
 
                 const updateList = listType === 'bgm' ? setBgms : setSfxs;
                 updateList(prev => {
@@ -175,47 +186,101 @@
                 });
             };
 
-            // 【核心修正】：播放邏輯改為呼叫預載好的實體
+            // 【核心引擎：6 秒交叉淡化運算】
+            const doFade = (id, audio, targetVol, durationMs, onComplete) => {
+                // 如果該音軌已經有正在執行的淡化，先取消它
+                if (fadeIntervals.current[id]) {
+                    cancelAnimationFrame(fadeIntervals.current[id]);
+                }
+                
+                const startVol = audio.volume;
+                const startTime = performance.now();
+                
+                // 使用瀏覽器渲染幀同步，達到極致平滑的漸變
+                const step = (currentTime) => {
+                    const elapsed = currentTime - startTime;
+                    const progress = Math.min(elapsed / durationMs, 1); // 0 到 1 的進度
+                    
+                    // 線性計算目前音量，並確保絕對落在 0.0 ~ 1.0 的安全範圍以防報錯
+                    let currentVol = startVol + (targetVol - startVol) * progress;
+                    currentVol = Math.max(0, Math.min(1, currentVol));
+                    
+                    audio.volume = currentVol;
+                    
+                    if (progress < 1) {
+                        // 尚未完成，安排下一幀繼續
+                        fadeIntervals.current[id] = requestAnimationFrame(step);
+                    } else {
+                        // 淡化完成
+                        delete fadeIntervals.current[id];
+                        if (onComplete) onComplete();
+                    }
+                };
+                
+                fadeIntervals.current[id] = requestAnimationFrame(step);
+            };
+
             const playSound = (id, type) => {
                 if (isEditMode) return;
                 const targetAudio = audioCache.current[id];
                 if (!targetAudio) return;
 
                 if (type === 'bgm') {
-                    // 切換 BGM：停止當前播放的 BGM
-                    if (activeBgmId && audioCache.current[activeBgmId]) {
-                        audioCache.current[activeBgmId].pause();
-                        audioCache.current[activeBgmId].currentTime = 0;
-                    }
+                    // 防手抖：若點擊同首正在播放的音樂，則忽略
+                    if (activeBgmId === id && !targetAudio.paused) return;
+
+                    // 1. 處理【所有】正在播放的舊 BGM (觸發 3 秒 Fade Out)
+                    // 使用迴圈是確保若您連續快速點擊多首歌，所有正在響的舊歌都會平滑淡出，不會卡在背景
+                    bgms.forEach(bgm => {
+                        const oldAudio = audioCache.current[bgm.id];
+                        if (oldAudio && !oldAudio.paused && bgm.id !== id) {
+                            doFade(bgm.id, oldAudio, 0, 3000, () => {
+                                oldAudio.pause();
+                                oldAudio.currentTime = 0;
+                            });
+                        }
+                    });
+
+                    // 2. 處理【新】的 BGM (觸發 3 秒 Fade In)
+                    targetAudio.volume = 0; // 先將音量歸零
                     targetAudio.currentTime = 0;
-                    targetAudio.play().then(() => setActiveBgmId(id)).catch(e => console.error("BGM Error:", e));
+                    targetAudio.play().then(() => {
+                        setActiveBgmId(id);
+                        // 3 秒漸強至目前設定的總音量
+                        doFade(id, targetAudio, volume, 3000);
+                    }).catch(e => console.error("BGM Error:", e));
+
                 } else {
-                    // 切換 SFX：防誤觸設計
-                    if (activeSfxId === id && !targetAudio.paused) return; // 正在播同一個，忽略
+                    // SFX 特效音效不需要漸變，維持瞬間切換
+                    if (activeSfxId === id && !targetAudio.paused) return; 
                     
                     if (activeSfxId && activeSfxId !== id && audioCache.current[activeSfxId]) {
                         audioCache.current[activeSfxId].pause();
                         audioCache.current[activeSfxId].currentTime = 0;
                     }
+                    targetAudio.volume = volume; // 直接套用總音量
                     targetAudio.currentTime = 0;
                     targetAudio.play().then(() => setActiveSfxId(id)).catch(e => console.error("SFX Error:", e));
                 }
             };
 
             const stopAll = () => {
-                if (activeBgmId && audioCache.current[activeBgmId]) {
-                    audioCache.current[activeBgmId].pause();
-                    audioCache.current[activeBgmId].currentTime = 0;
-                }
-                if (activeSfxId && audioCache.current[activeSfxId]) {
-                    audioCache.current[activeSfxId].pause();
-                    audioCache.current[activeSfxId].currentTime = 0;
-                }
+                // 停止所有淡化排程
+                Object.keys(fadeIntervals.current).forEach(id => {
+                    cancelAnimationFrame(fadeIntervals.current[id]);
+                });
+                fadeIntervals.current = {};
+
+                Object.values(audioCache.current).forEach(audio => {
+                    if (audio) {
+                        audio.pause();
+                        audio.currentTime = 0;
+                    }
+                });
                 setActiveBgmId(null);
                 setActiveSfxId(null);
             };
 
-            // --- 匯出/匯入邏輯維持不變 ---
             const blobUrlToBase64 = async (url) => {
                 try {
                     const response = await fetch(url);
@@ -257,7 +322,6 @@
                 reader.onload = async (event) => {
                     try {
                         const data = JSON.parse(event.target.result);
-                        // 清理舊的緩存
                         Object.values(audioCache.current).forEach(audio => { if(audio) {audio.pause(); audio.src="";} });
                         audioCache.current = {};
 
@@ -270,7 +334,6 @@
                                     const blob = new Blob([new Uint8Array(byteNumbers)], { type: 'audio/mpeg' });
                                     const newUrl = URL.createObjectURL(blob);
                                     
-                                    // 【核心修正】：匯入時同步重建預載實體
                                     createAudioInstance(s.id, newUrl, listType);
                                     
                                     return { ...s, url: newUrl, base64Data: null };
@@ -325,7 +388,7 @@
                             <div className="flex items-center gap-2 mb-4 pb-2 border-b border-slate-700/50">
                                 <Radio className="text-purple-400" size={18} />
                                 <h2 className="text-sm font-bold text-slate-200">背景音樂 (BGM)</h2>
-                                <span className="text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded-full ml-auto">模式：切換重播</span>
+                                <span className="text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded-full ml-auto">模式：交叉淡化 (3秒)</span>
                             </div>
                             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">
                                 {bgms.map(sound => <SoundCard key={sound.id} sound={sound} type="bgm" isEditMode={isEditMode} activeBgmId={activeBgmId} activeSfxId={activeSfxId} playSound={playSound} removeSound={removeSound} updateSound={updateSound} handleFileUpload={handleFileUpload} />)}
@@ -344,7 +407,7 @@
                                 {isEditMode && <button onClick={() => addNewButton('sfx')} className="h-24 border-2 border-dashed border-slate-700 rounded-lg flex items-center justify-center text-slate-500 hover:text-yellow-400 hover:border-yellow-400/50 hover:bg-slate-800/50 transition-all"><Plus size={24} /></button>}
                             </div>
                         </div>
-                        <div className="text-center text-slate-600 text-[10px]">{isEditMode ? '已啟用硬體加速預先載入，解決 iPad 切換卡頓問題。' : '準備演出！'}</div>
+                        <div className="text-center text-slate-600 text-[10px]">{isEditMode ? 'BGM 區域已實裝 3 秒平滑交叉淡化引擎。' : '準備演出！'}</div>
                     </div>
                 </div>
             );
